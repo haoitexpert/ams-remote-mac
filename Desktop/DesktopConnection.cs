@@ -1,5 +1,7 @@
-// SignalR client matching DesktopHub on the server (/remote/hubs/desktop).
-// Streams the screen and relays input commands from the viewer.
+// SignalR client of AMS's DesktopHub (/remote/hubs/desktop): streams the screen to the viewer and applies its input.
+// The stream is what wwwroot/remote/viewer/src/CaptureProcessor.js reads: frames of [int32 JPEG length][float32 x, y,
+// width, height][uint64 timestamp][JPEG], cut into pieces small enough for the hub's 100 KB message limit.
+using System.Buffers.Binary;
 using System.Runtime.CompilerServices;
 using AMS.RemoteMac.Shared;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -9,114 +11,126 @@ namespace AMS.RemoteMac.Desktop;
 
 internal sealed class DesktopConnection : IAsyncDisposable
 {
+    private const int FrameHeaderSize = 28;
+    private const int StreamChunkSize = 60_000;
+    private const string MainDisplay = "Main display";
+    private static readonly TimeSpan FrameInterval = TimeSpan.FromMilliseconds(50);
+
     private readonly ConnectionInfo _info;
     private readonly Guid _sessionId;
     private readonly string _accessKey;
     private readonly string _requesterName;
     private readonly string _orgName;
-    private readonly string _orgId;
+    private readonly string _machineName = MacHost.ComputerName();
+    private readonly DtoChannel _dtos = new();
+    private readonly TaskCompletionSource _closed = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _streamGate = new();
     private HubConnection? _hub;
-    private ScreenCapture? _capture;
     private CancellationTokenSource? _streamCts;
 
-    public DesktopConnection(ConnectionInfo info, Guid sessionId, string accessKey,
-        string requesterName, string orgName, string orgId)
+    public DesktopConnection(ConnectionInfo info, Guid sessionId, string accessKey, string requesterName, string orgName)
     {
         _info = info;
         _sessionId = sessionId;
         _accessKey = accessKey;
         _requesterName = requesterName;
         _orgName = orgName;
-        _orgId = orgId;
     }
 
+    /// <summary>Runs until AMS ends the session or the connection drops; AMS restarts the process through the agent if needed.</summary>
     public async Task ConnectAndRunAsync(CancellationToken ct)
     {
-        var hubUrl = _info.Host.TrimEnd('/');
-        if (!hubUrl.EndsWith("/remote", StringComparison.OrdinalIgnoreCase))
-            hubUrl += "/remote";
-        hubUrl += "/hubs/desktop";
-
         _hub = new HubConnectionBuilder()
-            .WithUrl(hubUrl)
+            .WithUrl(_info.HubUrl("desktop"))
             .AddMessagePackProtocol()
             .Build();
-
-        RegisterCallbacks();
+        RegisterCallbacks(_hub);
+        _hub.Closed += _ =>
+        {
+            _closed.TrySetResult();
+            return Task.CompletedTask;
+        };
         await _hub.StartAsync(ct);
 
-        // Tell the server this desktop process owns the session.
         var result = await _hub.InvokeAsync<RcResult>("ReceiveUnattendedSessionInfo",
-            _sessionId, _accessKey, Environment.MachineName, _requesterName, _orgName, ct);
-
+            _sessionId, _accessKey, _machineName, _requesterName, _orgName, ct);
         if (!result.IsSuccess)
         {
             Console.Error.WriteLine($"Session rejected: {result.Reason}");
             return;
         }
 
-        // Tell the server the session is ready for viewers.
         await _hub.InvokeAsync("NotifyRequesterUnattendedReady", ct);
-        Console.WriteLine("Desktop session ready, waiting for viewer...");
-
-        // Keep running until cancelled.
-        try { await Task.Delay(Timeout.Infinite, ct); }
-        catch (OperationCanceledException) { }
+        Console.WriteLine("Desktop session ready, waiting for the viewer");
+        await _closed.Task.WaitAsync(ct);
     }
 
-    private void RegisterCallbacks()
+    private void RegisterCallbacks(HubConnection hub)
     {
-        // Server → Desktop: a viewer wants the screen.
-        _hub!.On<string, string, bool, Guid>("GetScreenCast",
-            async (viewerId, requesterName, notifyUser, streamId) =>
-            {
-                Console.WriteLine($"Screen cast requested by {requesterName} (stream {streamId})");
-                await StartStreaming(streamId);
-            });
+        hub.On<string, string, bool, Guid>("GetScreenCast", (viewerId, _, _, streamId) => _ = StartStreamingAsync(viewerId, streamId));
+        hub.On<string, string, bool, Guid>("RequestScreenCast", (viewerId, _, _, streamId) => _ = StartStreamingAsync(viewerId, streamId));
 
-        _hub.On<string, string, bool, Guid>("RequestScreenCast",
-            async (viewerId, requesterName, notifyUser, streamId) =>
-            {
-                Console.WriteLine($"Screen cast request from {requesterName} (stream {streamId})");
-                await StartStreaming(streamId);
-            });
-
-        // Server → Desktop: input from the viewer (binary DTO wrapper from the browser).
-        _hub.On<byte[], string>("SendDtoToClient", (dtoWrapper, viewerConnectionId) =>
+        hub.On<byte[], string>("SendDtoToClient", (wrapper, _) =>
         {
-            ProcessInputDto(dtoWrapper);
+            try
+            {
+                if (_dtos.Read(wrapper) is { } dto) Apply(dto);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Input error: {ex.Message}");
+            }
         });
 
-        _hub.On<string>("ViewerDisconnected", viewerId =>
+        hub.On<string>("ViewerDisconnected", viewerId =>
         {
             Console.WriteLine($"Viewer {viewerId} disconnected");
             StopStreaming();
         });
 
-        _hub.On<string>("Disconnect", reason =>
+        hub.On<string>("Disconnect", reason =>
         {
-            Console.WriteLine($"Disconnected: {reason}");
+            Console.WriteLine($"Disconnected by AMS: {reason}");
             StopStreaming();
+            _closed.TrySetResult();
         });
 
-        // PromptForAccess: AMS asks whether the user consents. In unattended mode, always accept.
-        _hub.On<RemoteControlAccessRequest>("PromptForAccess", request =>
-        {
-            return Task.FromResult(PromptForAccessResult.Accepted);
-        });
+        // The user already agreed by reading the IT Remote Support password to IT; AMS checked it before starting the session.
+        hub.On<RemoteControlAccessRequest, PromptForAccessResult>("PromptForAccess", _ => PromptForAccessResult.Accepted);
     }
 
-    private async Task StartStreaming(Guid streamId)
+    private async Task StartStreamingAsync(string viewerId, Guid streamId)
     {
-        StopStreaming();
-        _capture = new ScreenCapture();
-        _streamCts = new CancellationTokenSource();
-
-        Console.WriteLine($"Streaming screen ({_capture.Width}x{_capture.Height})");
-
         try
         {
-            await _hub!.SendAsync("SendDesktopStream", GenerateFrames(_streamCts.Token), streamId);
+            CancellationTokenSource cts;
+            lock (_streamGate)
+            {
+                _streamCts?.Cancel();
+                _streamCts = cts = new CancellationTokenSource();
+            }
+
+            var hub = _hub!;
+            if (!CoreGraphics.CGPreflightScreenCaptureAccess())
+                await hub.InvokeAsync("SendMessageToViewer", viewerId,
+                    "This Mac has not allowed Screen Recording for IT Remote Control: only the desktop background shows. Ask the user to click Screen Recording in the IT Remote Support window and turn it on.");
+            if (!CoreGraphics.AXIsProcessTrusted())
+                await hub.InvokeAsync("SendMessageToViewer", viewerId,
+                    "This Mac has not allowed Accessibility for IT Remote Control: you can see the screen but not control it. Ask the user to click Accessibility in the IT Remote Support window and turn it on.");
+
+            var capture = new ScreenCapture();
+            var first = capture.CaptureChanges();
+            await hub.InvokeAsync("SendDtoToViewer", DtoChannel.Wrap(DtoType.ScreenData, new()
+            {
+                ["MachineName"] = _machineName,
+                ["DisplayNames"] = new[] { MainDisplay },
+                ["SelectedDisplay"] = MainDisplay,
+                ["ScreenWidth"] = capture.Width,
+                ["ScreenHeight"] = capture.Height,
+            }), viewerId);
+
+            Console.WriteLine($"Streaming {capture.Width}x{capture.Height} to {viewerId}");
+            await hub.SendAsync("SendDesktopStream", Frames(viewerId, capture, first, cts.Token), streamId);
         }
         catch (Exception ex)
         {
@@ -124,107 +138,100 @@ internal sealed class DesktopConnection : IAsyncDisposable
         }
     }
 
-    private async IAsyncEnumerable<byte[]> GenerateFrames([EnumeratorCancellation] CancellationToken ct)
+    private async IAsyncEnumerable<byte[]> Frames(string viewerId, ScreenCapture capture, Frame? first,
+        [EnumeratorCancellation] CancellationToken ct)
     {
-        if (_capture is null) yield break;
-
-        // Send a full frame first.
-        var fullFrame = _capture.CaptureFullFrame();
-        if (fullFrame is not null)
-            yield return fullFrame;
-
-        // Then send only changed tiles.
+        var (width, height) = (capture.Width, capture.Height);
+        var frame = first;
         while (!ct.IsCancellationRequested)
         {
-            await Task.Delay(33, ct); // ~30 FPS cap
+            if (frame is not null)
+            {
+                if (capture.Width != width || capture.Height != height)
+                {
+                    (width, height) = (capture.Width, capture.Height);
+                    await _hub!.InvokeAsync("SendDtoToViewer", DtoChannel.Wrap(DtoType.ScreenSize, new()
+                    {
+                        ["Width"] = width,
+                        ["Height"] = height,
+                    }), viewerId, CancellationToken.None);
+                }
+                var bytes = Encode(frame);
+                for (var i = 0; i < bytes.Length; i += StreamChunkSize)
+                    yield return bytes[i..Math.Min(bytes.Length, i + StreamChunkSize)];
+            }
 
-            var changed = _capture.CaptureChangedRegions();
-            if (changed is not null)
-                yield return changed;
+            try { await Task.Delay(FrameInterval, ct); }
+            catch (OperationCanceledException) { }
+            if (ct.IsCancellationRequested) break;
+
+            try { frame = capture.CaptureChanges(); }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"Capture error: {ex.Message}");
+                frame = null;
+            }
+        }
+    }
+
+    internal static byte[] Encode(Frame frame)
+    {
+        var bytes = new byte[FrameHeaderSize + frame.Jpeg.Length];
+        var span = bytes.AsSpan();
+        BinaryPrimitives.WriteInt32LittleEndian(span, frame.Jpeg.Length);
+        BinaryPrimitives.WriteSingleLittleEndian(span[4..], frame.X);
+        BinaryPrimitives.WriteSingleLittleEndian(span[8..], frame.Y);
+        BinaryPrimitives.WriteSingleLittleEndian(span[12..], frame.Width);
+        BinaryPrimitives.WriteSingleLittleEndian(span[16..], frame.Height);
+        BinaryPrimitives.WriteInt64LittleEndian(span[20..], DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        frame.Jpeg.CopyTo(span[FrameHeaderSize..]);
+        return bytes;
+    }
+
+    private static void Apply(Dto dto)
+    {
+        switch (dto.Type)
+        {
+            case DtoType.MouseMove:
+                InputRelay.MouseMove(dto.Number("PercentX"), dto.Number("PercentY"));
+                break;
+            case DtoType.MouseDown:
+            case DtoType.MouseUp:
+                InputRelay.MouseButton((int)dto.Number("Button"), dto.Type == DtoType.MouseDown, dto.Number("PercentX"), dto.Number("PercentY"));
+                break;
+            case DtoType.Tap:
+                InputRelay.MouseMove(dto.Number("PercentX"), dto.Number("PercentY"));
+                InputRelay.MouseButton(0, true, dto.Number("PercentX"), dto.Number("PercentY"));
+                InputRelay.MouseButton(0, false, dto.Number("PercentX"), dto.Number("PercentY"));
+                break;
+            case DtoType.MouseWheel:
+                InputRelay.Wheel(dto.Number("DeltaX"), dto.Number("DeltaY"));
+                break;
+            case DtoType.KeyDown:
+                InputRelay.KeyDown(dto.Text("Key"));
+                break;
+            case DtoType.KeyUp:
+                InputRelay.KeyUp(dto.Text("Key"));
+                break;
+            case DtoType.KeyPress:
+                InputRelay.KeyPress(dto.Text("Key"));
+                break;
+            case DtoType.TextTransfer when dto.Flag("TypeText"):
+                InputRelay.TypeText(dto.Text("Text"));
+                break;
+            case DtoType.SetKeyStatesUp:
+                InputRelay.ReleaseAll();
+                break;
         }
     }
 
     private void StopStreaming()
     {
-        _streamCts?.Cancel();
-        _streamCts?.Dispose();
-        _streamCts = null;
-        _capture?.Dispose();
-        _capture = null;
-    }
-
-    /// <summary>
-    /// Processes input DTOs from the viewer. The browser viewer packs mouse/keyboard events as binary blobs
-    /// (DtoWrapper) that the desktop process interprets. The format comes from the Remotely viewer JS.
-    /// </summary>
-    private static void ProcessInputDto(byte[] dto)
-    {
-        if (dto is null || dto.Length < 1) return;
-
-        // The first byte is the DTO type.
-        var type = (DtoType)dto[0];
-
-        try
+        lock (_streamGate)
         {
-            switch (type)
-            {
-                case DtoType.MouseMove when dto.Length >= 17:
-                    var mx = BitConverter.ToDouble(dto, 1);
-                    var my = BitConverter.ToDouble(dto, 9);
-                    InputRelay.MouseAction(mx, my, 0, 0);
-                    break;
-
-                case DtoType.MouseDown when dto.Length >= 21:
-                    var mdx = BitConverter.ToDouble(dto, 1);
-                    var mdy = BitConverter.ToDouble(dto, 9);
-                    var mdb = BitConverter.ToInt32(dto, 17);
-                    InputRelay.MouseAction(mdx, mdy, mdb, 0);
-                    break;
-
-                case DtoType.MouseUp when dto.Length >= 21:
-                    var mux = BitConverter.ToDouble(dto, 1);
-                    var muy = BitConverter.ToDouble(dto, 9);
-                    var mub = BitConverter.ToInt32(dto, 17);
-                    InputRelay.MouseAction(mux, muy, mub, 0);
-                    break;
-
-                case DtoType.MouseWheel when dto.Length >= 19:
-                    var mwx = BitConverter.ToDouble(dto, 1);
-                    var mwy = BitConverter.ToDouble(dto, 9);
-                    var wheel = BitConverter.ToInt16(dto, 17);
-                    InputRelay.MouseAction(mwx, mwy, 0, wheel);
-                    break;
-
-                case DtoType.KeyDown when dto.Length >= 2:
-                    InputRelay.KeyAction(dto[1], false);
-                    break;
-
-                case DtoType.KeyUp when dto.Length >= 2:
-                    InputRelay.KeyAction(dto[1], true);
-                    break;
-
-                case DtoType.KeyPress when dto.Length >= 3:
-                    var ch = BitConverter.ToUInt16(dto, 1);
-                    InputRelay.KeyActionUnicode(ch, false);
-                    break;
-            }
+            _streamCts?.Cancel();
+            _streamCts = null;
         }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Input error: {ex.Message}");
-        }
-    }
-
-    private enum DtoType : byte
-    {
-        MouseMove = 1,
-        MouseDown = 2,
-        MouseUp = 3,
-        MouseWheel = 4,
-        KeyDown = 5,
-        KeyUp = 6,
-        KeyPress = 7,
-        // ... other types the viewer may send
     }
 
     public async ValueTask DisposeAsync()

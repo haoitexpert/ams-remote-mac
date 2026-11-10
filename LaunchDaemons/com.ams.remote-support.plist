@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- LaunchAgent: the IT Remote Support app starts at login and shows in the menu bar.
-     Install to ~/Library/LaunchAgents/com.ams.remote-support.plist
-     or to /Library/LaunchAgents/ for all users.
-     Load: launchctl load ~/Library/LaunchAgents/com.ams.remote-support.plist -->
+<!-- LaunchAgent: IT Remote Support starts at every user's login and stays in the menu bar.
+     Installed to /Library/LaunchAgents/com.ams.remote-support.plist by Installer/install.sh. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>

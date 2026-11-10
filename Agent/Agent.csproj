@@ -2,8 +2,7 @@
 
   <!-- CLT Agent for macOS: connects to AMS via SignalR, reports the computer, launches the desktop
        process when IT opens a session. Runs as a launchd daemon (/Library/LaunchDaemons).
-       Build:  dotnet publish -c Release -r osx-arm64 --self-contained
-               dotnet publish -c Release -r osx-x64   --self-contained -->
+       Build: dotnet publish -c Release -r osx-arm64 (or osx-x64); single file, self-contained. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
@@ -18,8 +17,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Shared\Shared.csproj" />
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.14" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="10.0.14" />
   </ItemGroup>
 
 </Project>

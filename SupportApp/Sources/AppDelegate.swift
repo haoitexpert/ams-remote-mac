@@ -27,8 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func reveal() {
-        window?.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        window?.reopen()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

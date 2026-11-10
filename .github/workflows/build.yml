@@ -1,17 +1,12 @@
 name: Build macOS Remote Support
 
+# Outputs, under the run's Artifacts:
+#   CLT-Mac-arm64, CLT-Mac-x64   the client packages: upload each zip as-is on AMS (IT Assets → Settings → Remote Access)
+#   AMS-Remote-Setup-pkg         the installer stub: AMS-Remote-Setup.pkg goes in the AMS repo, Services/RemoteControl/Assets/
+# Only the Swift app and the .pkg need a Mac; the .NET binaries cross-compile on Linux (install.sh signs them on the Mac).
+
 on:
   workflow_dispatch:
-    inputs:
-      platform:
-        description: "Target architecture"
-        type: choice
-        options:
-          - both
-          - arm64
-          - x64
-        default: both
-
   push:
     branches: [main]
     paths:
@@ -20,114 +15,95 @@ on:
       - "Shared/**"
       - "SupportApp/**"
       - "Installer/**"
-      - "build.sh"
+      - "LaunchDaemons/**"
+      - "pkg/**"
+      - ".github/workflows/build.yml"
 
 jobs:
-  build:
+  dotnet:
+    name: CLT-Agent + CLT-Desktop (${{ matrix.arch }})
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        include:
-          - arch: arm64
-            rid: osx-arm64
-            runner: macos-13
-            swift-arch: arm64
-          - arch: x64
-            rid: osx-x64
-            runner: macos-13
-            swift-arch: x86_64
-
-    runs-on: ${{ matrix.runner }}
-    name: CLT-Mac-${{ matrix.arch }}
-
+        arch: [arm64, x64]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install .NET 10 SDK
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "10.0.x"
-
-      - name: Verify tools
+      - name: Publish
         run: |
-          echo "--- .NET ---"
-          dotnet --version
-          echo "--- Swift ---"
-          swift --version
-          echo "--- Xcode CLT ---"
-          xcode-select -p
+          dotnet publish Agent/Agent.csproj -c Release -r osx-${{ matrix.arch }} -o out
+          dotnet publish Desktop/Desktop.csproj -c Release -r osx-${{ matrix.arch }} -o out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: net-${{ matrix.arch }}
+          path: |
+            out/CLT-Agent
+            out/CLT-Desktop
+          retention-days: 1
 
-      - name: Build CLT-Agent
-        run: |
-          dotnet publish Agent/Agent.csproj \
-            -c Release -r ${{ matrix.rid }} --self-contained \
-            -o build/Agent
-
-      - name: Build CLT-Desktop
-        run: |
-          dotnet publish Desktop/Desktop.csproj \
-            -c Release -r ${{ matrix.rid }} --self-contained \
-            -o build/Desktop
-
-      - name: Build IT Remote Support (Swift)
+  mac:
+    name: IT Remote Support app + installer pkg
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the app (universal)
         working-directory: SupportApp
-        run: swift build -c release --arch ${{ matrix.swift-arch }}
-
-      - name: Create .app bundle
         run: |
-          APP="build/AMS Remote Support.app"
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-
-          cp "SupportApp/.build/release/AMS-Remote-Support" \
-             "$APP/Contents/MacOS/"
-
-          cat > "$APP/Contents/Info.plist" << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>AMS-Remote-Support</string>
-              <key>CFBundleIdentifier</key>
-              <string>com.ams.remote-support</string>
-              <key>CFBundleName</key>
-              <string>AMS Remote Support</string>
-              <key>CFBundleDisplayName</key>
-              <string>IT Remote Support</string>
-              <key>CFBundleVersion</key>
-              <string>1.0.0</string>
-              <key>CFBundleShortVersionString</key>
-              <string>1.0</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>12.0</string>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-              <key>LSUIElement</key>
-              <false/>
-          </dict>
-          </plist>
-          EOF
-
-      - name: Create distribution zip
+          swift build -c release --arch arm64 --arch x86_64
+          BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+          APP="$GITHUB_WORKSPACE/out/AMS Remote Support.app"
+          mkdir -p "$APP/Contents/MacOS"
+          cp "$BIN/AMS-Remote-Support" "$APP/Contents/MacOS/"
+          cp Info.plist "$APP/Contents/"
+          lipo -info "$APP/Contents/MacOS/AMS-Remote-Support"
+      - name: Build AMS-Remote-Setup.pkg
         run: |
-          DIST="CLT-Mac-${{ matrix.arch }}"
-          mkdir -p "build/dist/$DIST"
+          mkdir -p pkg-scripts
+          cp pkg/postinstall Installer/install.sh Installer/uninstall.sh pkg-scripts/
+          chmod 755 pkg-scripts/*
+          pkgbuild --nopayload --scripts pkg-scripts --identifier com.ams.remote-setup --version 1.0 out/AMS-Remote-Setup.pkg
+          pkgutil --expand out/AMS-Remote-Setup.pkg expanded && ls -R expanded
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: out/AMS Remote Support.app
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AMS-Remote-Setup-pkg
+          path: out/AMS-Remote-Setup.pkg
+          retention-days: 30
 
-          cp -R build/Agent/*    "build/dist/$DIST/"
-          cp -R build/Desktop/*  "build/dist/$DIST/"
-          cp -R "build/AMS Remote Support.app" "build/dist/$DIST/"
-          cp Installer/*         "build/dist/$DIST/"
-          cp -R LaunchDaemons    "build/dist/$DIST/"
-
-          cd build/dist
-          zip -r "$DIST.zip" "$DIST/"
-          echo "Package: $DIST.zip ($(du -h "$DIST.zip" | cut -f1))"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+  package:
+    name: CLT-Mac-${{ matrix.arch }}
+    needs: [dotnet, mac]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64, x64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: net-${{ matrix.arch }}
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: app
+          path: dist/AMS Remote Support.app
+      - name: Wrap CLT-Desktop as IT Remote Control, add the launchd plists and the uninstaller
+        run: |
+          HELPER="dist/AMS Remote Control.app/Contents"
+          mkdir -p "$HELPER/MacOS"
+          mv dist/CLT-Desktop "$HELPER/MacOS/"
+          cp Desktop/Info.plist "$HELPER/"
+          cp LaunchDaemons/*.plist Installer/uninstall.sh dist/
+          ls -lR dist
+      # The artifact zip is the package: its files sit at the root, and install.sh restores the permissions it drops.
+      - uses: actions/upload-artifact@v4
         with:
           name: CLT-Mac-${{ matrix.arch }}
-          path: build/dist/CLT-Mac-${{ matrix.arch }}.zip
+          path: dist/
           retention-days: 30

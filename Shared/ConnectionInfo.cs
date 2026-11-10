@@ -30,6 +30,9 @@ public sealed class ConnectionInfo
         }
     }
 
+    /// <summary>One of AMS's remote-control hubs: "service" (agent) or "desktop".</summary>
+    public string HubUrl(string hub) => $"{AmsUrl}/remote/hubs/{hub}";
+
     public static ConnectionInfo? Load()
     {
         var paths = new[]

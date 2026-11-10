@@ -1,5 +1,5 @@
-// SignalR client matching AgentHub on the server (/remote/hubs/service).
-// Speaks the same MessagePack protocol as the Windows CLT agent.
+// SignalR client of AMS's AgentHub (/remote/hubs/service), speaking the same MessagePack protocol as the Windows CLT agent.
+using System.Diagnostics;
 using AMS.RemoteMac.Shared;
 using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.DependencyInjection;
@@ -8,6 +8,8 @@ namespace AMS.RemoteMac.Agent;
 
 internal sealed class AgentConnection : IAsyncDisposable
 {
+    private const string Uninstaller = "/usr/local/lib/CLT/uninstall.sh";
+
     private readonly ConnectionInfo _info;
     private HubConnection? _hub;
 
@@ -15,76 +17,95 @@ internal sealed class AgentConnection : IAsyncDisposable
 
     public async Task ConnectAsync(CancellationToken ct)
     {
-        var hubUrl = _info.Host.TrimEnd('/');
-        if (!hubUrl.EndsWith("/remote", StringComparison.OrdinalIgnoreCase))
-            hubUrl += "/remote";
-        hubUrl += "/hubs/service";
+        if (_hub is not null) await _hub.DisposeAsync();
 
         _hub = new HubConnectionBuilder()
-            .WithUrl(hubUrl)
+            .WithUrl(_info.HubUrl("service"))
             .AddMessagePackProtocol()
             .WithAutomaticReconnect(new[] { TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30) })
             .Build();
-
         RegisterServerCallbacks(_hub);
-        await _hub.StartAsync(ct);
 
-        var device = MacDeviceInfo.Collect(_info);
-        var accepted = await _hub.InvokeAsync<bool>("DeviceCameOnline", device, ct);
-        if (!accepted) throw new InvalidOperationException("AMS refused this agent (wrong key or remote access is off).");
+        // AgentHub knows which computer a connection is only after DeviceCameOnline; a reconnect is a new connection.
+        _hub.Reconnected += async _ =>
+        {
+            try { await AnnounceAsync(CancellationToken.None); }
+            catch (Exception ex) { Console.Error.WriteLine($"Re-announcing after reconnect failed: {ex.Message}"); }
+        };
+
+        await _hub.StartAsync(ct);
+        await AnnounceAsync(ct);
     }
 
+    /// <summary>Heartbeats until the connection is gone for good (automatic reconnects used up), then returns.</summary>
     public async Task RunAsync(CancellationToken ct)
     {
-        await _hub!.InvokeAsync("CheckForPendingRemoteControlSessions", ct);
+        var hub = _hub!;
+        var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        hub.Closed += _ =>
+        {
+            closed.TrySetResult();
+            return Task.CompletedTask;
+        };
+        if (hub.State == HubConnectionState.Disconnected) return;
 
         while (!ct.IsCancellationRequested)
         {
-            await Task.Delay(TimeSpan.FromMinutes(5), ct);
-            var device = MacDeviceInfo.Collect(_info);
-            await _hub.InvokeAsync("DeviceHeartbeat", device, ct);
+            var tick = Task.Delay(TimeSpan.FromMinutes(5), ct);
+            if (await Task.WhenAny(tick, closed.Task) == closed.Task) return;
+            await tick;
+            if (hub.State != HubConnectionState.Connected) continue;
+            try { await hub.InvokeAsync("DeviceHeartbeat", MacDeviceInfo.Collect(_info), ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { Console.Error.WriteLine($"Heartbeat failed: {ex.Message}"); }
         }
+    }
+
+    private async Task AnnounceAsync(CancellationToken ct)
+    {
+        var hub = _hub!;
+        var accepted = await hub.InvokeAsync<bool>("DeviceCameOnline", MacDeviceInfo.Collect(_info), ct);
+        if (!accepted) throw new InvalidOperationException("AMS refused this agent (wrong key or remote access is off).");
+        await hub.InvokeAsync("CheckForPendingRemoteControlSessions", ct);
     }
 
     private void RegisterServerCallbacks(HubConnection hub)
     {
-        // Server → Agent: start the desktop process for a remote control session.
         hub.On<Guid, string, string, string, string, string>("RemoteControl",
-            (sessionId, accessKey, userConnectionId, requesterName, orgName, orgId) =>
+            (sessionId, accessKey, _, requesterName, orgName, _) =>
             {
                 Console.WriteLine($"Remote control requested by {requesterName} (session {sessionId})");
-                _ = DesktopLauncher.LaunchAsync(_info, sessionId, accessKey, userConnectionId, requesterName, orgName, orgId);
+                DesktopLauncher.Launch(sessionId, accessKey, requesterName, orgName);
             });
 
         hub.On<string[], string, string, string, string, string, string>("RestartScreenCaster",
-            (viewerIds, sessionId, accessKey, userConnectionId, requesterName, orgName, orgId) =>
+            (_, sessionId, accessKey, _, requesterName, orgName, _) =>
             {
                 Console.WriteLine($"Restarting screen caster for session {sessionId}");
-                if (Guid.TryParse(sessionId, out var sid))
-                    _ = DesktopLauncher.LaunchAsync(_info, sid, accessKey, userConnectionId, requesterName, orgName, orgId);
+                if (Guid.TryParse(sessionId, out var sid)) DesktopLauncher.Launch(sid, accessKey, requesterName, orgName);
             });
 
         hub.On("TriggerHeartbeat", async () =>
         {
-            var device = MacDeviceInfo.Collect(_info);
-            await hub.InvokeAsync("DeviceHeartbeat", device);
+            try { await hub.InvokeAsync("DeviceHeartbeat", MacDeviceInfo.Collect(_info)); }
+            catch (Exception ex) { Console.Error.WriteLine($"Heartbeat failed: {ex.Message}"); }
         });
 
-        hub.On("InvokeCtrlAltDel", () =>
-        {
-            // macOS has no Ctrl+Alt+Del; log it and ignore.
-            Console.WriteLine("InvokeCtrlAltDel requested (not applicable on macOS)");
-        });
+        hub.On("InvokeCtrlAltDel", () => Console.WriteLine("Ctrl+Alt+Del requested: nothing to do on macOS"));
 
         hub.On("UninstallAgent", () =>
         {
-            Console.WriteLine("Uninstall requested");
-            // Run the uninstaller and exit.
-            _ = Task.Run(async () =>
+            Console.WriteLine("Uninstall requested by AMS");
+            // The script unloads this daemon as its very last step, which ends this process (and the script) with it.
+            if (!File.Exists(Uninstaller))
             {
-                await Task.Delay(1000);
-                Environment.Exit(0);
-            });
+                Console.Error.WriteLine($"{Uninstaller} is missing: install the client again, then uninstall.");
+                return;
+            }
+            try
+            {
+                Process.Start(new ProcessStartInfo("/bin/bash", new[] { Uninstaller }) { UseShellExecute = false });
+            }
+            catch (Exception ex) { Console.Error.WriteLine($"Could not start the uninstaller: {ex.Message}"); }
         });
     }
 

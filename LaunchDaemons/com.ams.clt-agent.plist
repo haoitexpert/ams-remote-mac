@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- LaunchDaemon: the CLT agent runs at boot as root, connects to AMS, stays connected.
-     Install to /Library/LaunchDaemons/com.ams.clt-agent.plist
-     Load:   sudo launchctl load /Library/LaunchDaemons/com.ams.clt-agent.plist
-     Unload: sudo launchctl unload /Library/LaunchDaemons/com.ams.clt-agent.plist -->
+     Installed to /Library/LaunchDaemons/com.ams.clt-agent.plist by Installer/install.sh.
+     Start: sudo launchctl bootstrap system /Library/LaunchDaemons/com.ams.clt-agent.plist
+     Stop:  sudo launchctl bootout system/com.ams.clt-agent -->
 <plist version="1.0">
 <dict>
     <key>Label</key>

@@ -7,10 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "AMS-Remote-Support",
-            path: "Sources",
-            resources: [
-                .process("../Resources"),
-            ]
+            path: "Sources"
         ),
     ]
 )

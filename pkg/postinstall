@@ -1,0 +1,22 @@
+#!/bin/bash
+# AMS-Remote-Setup.pkg's only step, run as root by Installer when the user opens the .pkg.
+# AMS appends the server's address and the agent key to the .pkg when IT exports it (GET /remote/setup.pkg), with the same
+# tail as AMS-Remote-Setup.exe: [UTF-8 "address\nkey"][its length, int32 little-endian]["AMSRCFG1"]. Installer passes
+# the path of the .pkg being installed as $1. The output goes to /var/log/install.log.
+set -euo pipefail
+
+PKG="${1:-}"
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+[ -f "$PKG" ] || fail "Installer did not say which package it is running."
+[ "$(tail -c 8 "$PKG")" = "AMSRCFG1" ] \
+    || fail "This installer has no AMS server in it. Export it from AMS (IT Assets → Settings → Remote Access → Export macOS installer)."
+
+LENGTH=$(tail -c 12 "$PKG" | head -c 4 | od -An -tu4 | tr -d ' \n')
+[ -n "$LENGTH" ] && [ "$LENGTH" -gt 0 ] && [ "$LENGTH" -le 4096 ] || fail "The AMS settings at the end of this installer are damaged. Export it again."
+CONFIG=$(tail -c $((LENGTH + 12)) "$PKG" | head -c "$LENGTH")
+AMS_URL=${CONFIG%%$'\n'*}
+AGENT_KEY=${CONFIG#*$'\n'}
+[ -n "$AMS_URL" ] && [ -n "$AGENT_KEY" ] && [ "$AMS_URL" != "$CONFIG" ] || fail "The AMS settings at the end of this installer are damaged. Export it again."
+
+exec /bin/bash "$(dirname "$0")/install.sh" "$AMS_URL" "$AGENT_KEY"

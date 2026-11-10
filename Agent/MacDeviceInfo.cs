@@ -18,14 +18,14 @@ internal static class MacDeviceInfo
             AgentVersion = AgentVersion,
             ID = info.DeviceId,
             OrganizationID = info.OrganizationId,
-            DeviceName = Environment.MachineName,
+            DeviceName = MacHost.ComputerName(),
             Platform = "macOS",
             Is64Bit = true,
             IsOnline = true,
             OSArchitecture = RuntimeInformation.OSArchitecture,
             OSDescription = GetOsDescription(),
             ProcessorCount = Environment.ProcessorCount,
-            CurrentUser = GetConsoleUser(),
+            CurrentUser = MacHost.ConsoleUser()?.Name ?? string.Empty,
         };
 
         CollectMemory(dto);
@@ -43,13 +43,6 @@ internal static class MacDeviceInfo
         var build = Run("sw_vers", "-buildVersion").Trim();
         if (string.IsNullOrEmpty(name)) return RuntimeInformation.OSDescription;
         return $"{name} {version} ({build})";
-    }
-
-    private static string GetConsoleUser()
-    {
-        // scutil --get ConsoleUser returns the username of the logged-in GUI user.
-        var user = Run("scutil", "--get ConsoleUser").Trim();
-        return string.IsNullOrEmpty(user) || user == "loginwindow" ? Environment.UserName : user;
     }
 
     private static void CollectMemory(DeviceClientDto dto)

@@ -1,9 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!-- CLT Desktop for macOS: screen capture (CoreGraphics) + input relay (CGEvent) + SignalR to /remote/hubs/desktop.
-       Launched by the agent when IT starts a session; runs in the console user's GUI session for screen access.
-       Build:  dotnet publish -c Release -r osx-arm64 --self-contained
-               dotnet publish -c Release -r osx-x64   --self-contained -->
+       Launched by the agent when IT starts a session; runs as the signed-in user, in that user's GUI session.
+       Build: dotnet publish -c Release -r osx-arm64 (or osx-x64); single file, self-contained. -->
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
@@ -19,8 +18,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Shared\Shared.csproj" />
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.0" />
-    <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Client" Version="10.0.14" />
+    <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.MessagePack" Version="10.0.14" />
   </ItemGroup>
 
 </Project>
