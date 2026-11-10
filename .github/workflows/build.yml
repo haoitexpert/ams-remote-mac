@@ -1,0 +1,138 @@
+name: Build macOS Remote Support
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target architecture"
+        type: choice
+        options:
+          - both
+          - arm64
+          - x64
+        default: both
+
+  push:
+    branches: [main]
+    paths:
+      - "Agent/**"
+      - "Desktop/**"
+      - "Shared/**"
+      - "SupportApp/**"
+      - "Installer/**"
+      - "build.sh"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            rid: osx-arm64
+            runner: macos-14
+            swift-arch: arm64
+          - arch: x64
+            rid: osx-x64
+            runner: macos-13
+            swift-arch: x86_64
+
+    if: >-
+      github.event_name == 'push'
+      || inputs.platform == 'both'
+      || inputs.platform == matrix.arch
+
+    runs-on: ${{ matrix.runner }}
+    name: CLT-Mac-${{ matrix.arch }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Verify tools
+        run: |
+          echo "--- .NET ---"
+          dotnet --version
+          echo "--- Swift ---"
+          swift --version
+          echo "--- Xcode CLT ---"
+          xcode-select -p
+
+      - name: Build CLT-Agent
+        run: |
+          dotnet publish Agent/Agent.csproj \
+            -c Release -r ${{ matrix.rid }} --self-contained \
+            -o build/Agent
+
+      - name: Build CLT-Desktop
+        run: |
+          dotnet publish Desktop/Desktop.csproj \
+            -c Release -r ${{ matrix.rid }} --self-contained \
+            -o build/Desktop
+
+      - name: Build IT Remote Support (Swift)
+        working-directory: SupportApp
+        run: swift build -c release --arch ${{ matrix.swift-arch }}
+
+      - name: Create .app bundle
+        run: |
+          APP="build/AMS Remote Support.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp "SupportApp/.build/release/AMS-Remote-Support" \
+             "$APP/Contents/MacOS/"
+
+          cat > "$APP/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>AMS-Remote-Support</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.ams.remote-support</string>
+              <key>CFBundleName</key>
+              <string>AMS Remote Support</string>
+              <key>CFBundleDisplayName</key>
+              <string>IT Remote Support</string>
+              <key>CFBundleVersion</key>
+              <string>1.0.0</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>12.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSUIElement</key>
+              <false/>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Create distribution zip
+        run: |
+          DIST="CLT-Mac-${{ matrix.arch }}"
+          mkdir -p "build/dist/$DIST"
+
+          cp -R build/Agent/*    "build/dist/$DIST/"
+          cp -R build/Desktop/*  "build/dist/$DIST/"
+          cp -R "build/AMS Remote Support.app" "build/dist/$DIST/"
+          cp Installer/*         "build/dist/$DIST/"
+          cp -R LaunchDaemons    "build/dist/$DIST/"
+
+          cd build/dist
+          zip -r "$DIST.zip" "$DIST/"
+          echo "Package: $DIST.zip ($(du -h "$DIST.zip" | cut -f1))"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLT-Mac-${{ matrix.arch }}
+          path: build/dist/CLT-Mac-${{ matrix.arch }}.zip
+          retention-days: 30

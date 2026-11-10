@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent: the IT Remote Support app starts at login and shows in the menu bar.
+     Install to ~/Library/LaunchAgents/com.ams.remote-support.plist
+     or to /Library/LaunchAgents/ for all users.
+     Load: launchctl load ~/Library/LaunchAgents/com.ams.remote-support.plist -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ams.remote-support</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/AMS Remote Support.app/Contents/MacOS/AMS-Remote-Support</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+</dict>
+</plist>
