@@ -29,7 +29,7 @@ jobs:
         include:
           - arch: arm64
             rid: osx-arm64
-            runner: macos-14
+            runner: macos-13
             swift-arch: arm64
           - arch: x64
             rid: osx-x64
